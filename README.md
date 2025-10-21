@@ -1,1 +1,1 @@
-# EntropyAI
+pip install -U fastapi uvicorn[standard] python-multipart python-dotenv pandas numpy matplotlib openpyxl requests langchain-core langchain-openai langgraph

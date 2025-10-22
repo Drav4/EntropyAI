@@ -1,25 +1,28 @@
 # server/agent/graph.py
 import os, json
 from typing import TypedDict, List, Literal, Annotated, Optional
+
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    BaseMessage,
 )
-from services.dgen_toolshim import ToolBoundSocgen
-from tools_langgraph import TOOLS
+
+from tools_langgraph import make_llm, TOOLS  # ✅ keep your factory
 from config import UPLOAD_DIR
 
 
 # ---------- Agent State ----------
 class AgentState(TypedDict, total=False):
-    messages: Annotated[List, "Messages exchanged with LLM"]
+    messages: Annotated[List[BaseMessage], "Messages exchanged with LLM"]
     grounded: bool
     must_finalize: bool
     last_tool_name: Optional[str]
-    last_dataset: Optional[str]  # 👈 Persist dataset context
+    last_dataset: Optional[str]            # ✅ persist dataset between turns
+    step: int
 
 
 _MAX_STEPS = 8
@@ -36,16 +39,14 @@ def _exists_in_uploads(fid: Optional[str]) -> bool:
 # ---------- LLM Node ----------
 def llm_node(state: AgentState) -> AgentState:
     """Core LLM node."""
-    llm = ToolBoundSocgen().bind_tools(TOOLS)
-    step = state.get("step", 0) + 1
+    step = int(state.get("step", 0)) + 1
     if step > _MAX_STEPS:
-        return {
-            "messages": [AIMessage(content="Reached reasoning limit while looping over tools.")],
-        }
+        return {"messages": [AIMessage(content="I reached my reasoning limit while looping over tools.")]}
 
-    # Compose conversation
+    llm = make_llm().bind_tools(TOOLS)  # ✅ your factory
     msgs = state.get("messages", [])
-    out = llm.invoke(msgs, tool_choice="none", disable_tools=False)
+    out = llm.invoke(msgs, tool_choice=None)  # allow tools by default
+
     return {
         "messages": msgs + [out],
         "step": step,
@@ -55,66 +56,82 @@ def llm_node(state: AgentState) -> AgentState:
 
 # ---------- Tool Node ----------
 def tool_node(state: AgentState) -> AgentState:
-    """Runs tool and appends ToolMessage."""
+    """
+    Runs the tool indicated by the last assistant tool call and appends the ToolMessage.
+    Also injects/remember file_id_or_name so the first histogram works.
+    """
+    from services.socgen_toolshim import ToolBoundSocgen  # local import to avoid cycles
     base = ToolBoundSocgen()
+
     last = state["messages"][-1]
-    call = getattr(last, "tool_calls", None) or [{}]
-    call = call[0]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    if not tool_calls:
+        return {"messages": state["messages"]}  # nothing to do
 
-    fid = call.get("arguments", {}).get("file_id_or_name")
+    call = dict(tool_calls[0])  # shallow copy
 
-    # --- Fix: fallback to last dataset if not provided
+    # ---- dataset grounding / persistence ----
+    args = dict(call.get("args") or call.get("arguments") or {})
+    fid = args.get("file_id_or_name")
+
+    # 1) fallback to last remembered dataset
     if not fid:
         fid = state.get("last_dataset")
 
-    # --- Fallback to first uploaded attachment if still missing
+    # 2) fallback to first uploaded attachment (if you populate state['attachments'])
     if not fid and state.get("attachments"):
         fid = state["attachments"][0]
 
-    # --- Persist dataset reference
+    # 3) persist and inject back
     if fid:
-        call["arguments"]["file_id_or_name"] = fid
+        args["file_id_or_name"] = fid
         state["last_dataset"] = fid
 
-    # --- Skip invalid attachment
+    # 4) guard invalid dataset early
     if not _exists_in_uploads(fid):
-        return {
-            "messages": [
-                ToolMessage(content="Invalid or missing dataset reference.", name=call.get("name", "tool"))
-            ],
-            "must_finalize": True,
-        }
+        tm = ToolMessage(
+            name=call.get("name") or "tool",
+            content=json.dumps({
+                "ok": False,
+                "error": "Invalid or missing dataset reference.",
+                "arguments": args
+            })
+        )
+        return {"messages": state["messages"] + [tm], "must_finalize": True}
 
-    # Invoke tool safely
-    res = base.invoke_tool(call, state)
-    return {"messages": state["messages"] + [res], "must_finalize": False}
+    # normalize call obj (your shim accepts this shape)
+    call["args"] = args
+
+    # ---- invoke the tool via your shim ----
+    res_msg = base.invoke_tool(call, state)  # must return a ToolMessage
+    return {"messages": state["messages"] + [res_msg], "must_finalize": False}
 
 
-# ---------- After Tools Node ----------
+# ---------- After Tools ----------
 def after_tools(state: AgentState) -> AgentState:
-    """Handle post-tool cleanup and memory persistence."""
-    last = state["messages"][-1]
-    grounded = state.get("grounded", False)
-    last_tool_name = getattr(last, "name", None)
+    """
+    Post-tool updates: mark grounded where appropriate and persist last_dataset.
+    """
+    last_msg = state["messages"][-1]
+    grounded = bool(state.get("grounded", False))
+    last_tool_name = getattr(last_msg, "name", None)
 
+    # if you use compute_dataset_facts as your "grounding" tool, keep this:
     if last_tool_name == "compute_dataset_facts":
         grounded = True
 
-    new_state = dict(state)
-    new_state.update(
-        {
-            "grounded": grounded,
-            "step": state.get("step", 0) + 1,
-            "must_finalize": False,
-            "last_tool_name": last_tool_name,
-        }
-    )
+    new_state: AgentState = dict(state)
+    new_state.update({
+        "grounded": grounded,
+        "must_finalize": False,
+        "last_tool_name": last_tool_name,
+    })
 
-    # --- Persist last dataset used
+    # Try to persist dataset from tool output payload too
     try:
-        if isinstance(last, ToolMessage):
-            content = json.loads(last.content)
-            fid = content.get("arguments", {}).get("file_id_or_name")
+        if isinstance(last_msg, ToolMessage):
+            payload = json.loads(last_msg.content)
+            fid = (payload.get("arguments") or {}).get("file_id_or_name")
             if fid:
                 new_state["last_dataset"] = fid
     except Exception:
@@ -125,12 +142,9 @@ def after_tools(state: AgentState) -> AgentState:
 
 # ---------- Routing ----------
 def route_after_llm(state: AgentState) -> Literal["tools", "final"]:
-    """Route based on whether tool calls exist."""
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None)
-    if tool_calls:
-        return "tools"
-    return "final"
+    return "tools" if tool_calls else "final"
 
 
 # ---------- Graph Builder ----------
@@ -141,7 +155,6 @@ def build_graph():
     g.add_node("tools", tool_node)
     g.add_node("after_tools", after_tools)
 
-    # Flow control
     g.add_conditional_edges("llm", route_after_llm, {"tools": "tools", "final": END})
     g.add_edge("tools", "after_tools")
     g.add_edge("after_tools", "llm")

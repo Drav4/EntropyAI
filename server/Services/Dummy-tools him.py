@@ -6,7 +6,7 @@ from langchain_core.messages import (
     BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 )
 
-# ---------------- Prompt header ----------------
+# ----------- Prompt header (unchanged semantics) -----------
 TOOL_HEADER = (
     "You can call tools. When a tool is needed, reply with ONLY a single JSON object and nothing else.\n"
     'Schema: {"tool_name":"<name>","arguments":{...}}\n\n'
@@ -19,7 +19,7 @@ TOOL_HEADER = (
     "If no tool is needed, answer normally in plain text.\n"
 )
 
-# ---------------- Render messages for model ----------------
+# ----------- Render messages for model (same as yours) -----------
 def _render_messages(messages: List[BaseMessage]) -> str:
     lines: List[str] = []
     for m in messages:
@@ -34,7 +34,7 @@ def _render_messages(messages: List[BaseMessage]) -> str:
             lines.append(f"[ASSISTANT] {getattr(m, 'content', '') or ''}")
     return "\n".join(lines)
 
-# ---------------- Tools spec serializer ----------------
+# ----------- Tools spec serializer (same idea) -----------
 def _tools_to_prompt(tools: List[Any]) -> str:
     items = []
     for t in tools or []:
@@ -45,7 +45,7 @@ def _tools_to_prompt(tools: List[Any]) -> str:
         items.append({"name": name, "description": desc, "parameters": schema_json})
     return "TOOLS_SPEC:\n" + json.dumps(items, ensure_ascii=False)
 
-# Grab first JSON object even if surrounded by extra text/fences
+# ----------- Parse a JSON object out of model text -----------
 _JSON_BLOCK = re.compile(r"\{[\s\S]*?\}", re.DOTALL)
 
 def _try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
@@ -76,10 +76,8 @@ def _try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
 
 class ToolBoundSocgen:
     """
-    Adapter that:
-      * builds the full prompt (system header + tools spec + rendered messages)
-      * calls the underlying client (wired in your make_llm())
-      * returns AIMessage, optionally with .tool_calls normalized to {"name","args","id"}
+    Builds the tool-augmented prompt, calls your LLM client (wired via make_llm),
+    and returns AIMessage with .tool_calls normalized to {"name","args","id"}.
     """
 
     def __init__(self, client: Any = None, tools: Optional[List[Any]] = None):
@@ -89,7 +87,7 @@ class ToolBoundSocgen:
     def bind_tools(self, tools: List[Any]) -> "ToolBoundSocgen":
         return ToolBoundSocgen(client=self.client, tools=tools)
 
-    # Low-level model call wrapper (works with invoke/generate/callable clients)
+    # Works with invoke/generate/callable clients
     def _call_client(self, prompt: str) -> str:
         try:
             if hasattr(self.client, "invoke"):

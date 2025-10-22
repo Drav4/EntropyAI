@@ -1,144 +1,181 @@
-# server/agent/graph.py
-import os, json
+import os
+import json
 from typing import TypedDict, List, Literal, Annotated, Optional
 
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-    BaseMessage,
-)
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langgraph.graph.message import add_messages  # if you used this earlier, keep it; else safe to leave
+from langgraph.prebuilt import ToolNode
 
-from server.tools_langgraph import make_llm, TOOLS
-from server.services.socgen_toolshim import ToolBoundSocgen
-from server.config import UPLOAD_DIR
+from services.socgen_client import make_llm
+from tools_langgraph import TOOLS
+from config import UPLOAD_DIR
 
-
-# ---------------- Agent State ----------------
+# ---------- Agent state ----------
 class AgentState(TypedDict, total=False):
-    messages: Annotated[List[BaseMessage], "Messages exchanged with LLM"]
-    grounded: bool
+    # your original used Annotated[ add_messages ] – keep it if you had it
+    messages: Annotated[List[BaseMessage], add_messages]
+    attachments: List[str]                     # candidate file ids/names from [Attachments]
+    grounded: bool                             # True once we've computed dataset facts at least once
+    steps: int                                 # safety counter to avoid infinite loops
     must_finalize: bool
     last_tool_name: Optional[str]
-    last_dataset: Optional[str]          # ✅ persists dataset context
-    step: int
-
+    last_dataset: Optional[str]                # ✅ NEW: persist last used dataset
 
 _MAX_STEPS = 8
 
-
-# ---------------- Utils ----------------
 def _exists_in_uploads(fid: Optional[str]) -> bool:
     if not fid:
         return False
     path = fid if os.path.isabs(fid) else os.path.join(UPLOAD_DIR, fid)
     return os.path.exists(path)
 
-
-# ---------------- LLM Node ----------------
+# ---------- LLM node ----------
 def llm_node(state: AgentState) -> AgentState:
-    """Run the LLM and allow tool invocation."""
-    step = int(state.get("step", 0)) + 1
-    if step > _MAX_STEPS:
-        return {"messages": [AIMessage(content="I reached my reasoning limit while looping over tools.")]}
-    
-    llm = make_llm().bind_tools(TOOLS)              # ✅ your LLM factory
-    msgs = state.get("messages", [])
-    out = llm.invoke(msgs, tool_choice=None)        # ✅ allow tools
-
-    return {"messages": msgs + [out], "step": step, "must_finalize": False}
-
-
-# ---------------- Tool Node ----------------
-def tool_node(state: AgentState) -> AgentState:
     """
-    Executes the tool requested by the assistant.
-    Normalizes call structure and remembers the dataset.
+    Core LLM node.
+    - On the first pass (attachments present & not grounded), force a call to 'compute_dataset_facts'.
+    - Otherwise: normal tool-calling invocation.
     """
-    base = ToolBoundSocgen()
-    last = state["messages"][-1]
-    tool_calls = getattr(last, "tool_calls", None) or []
-    if not tool_calls:
-        return {"messages": state["messages"]}
+    llm = make_llm().bind_tools(TOOLS)
+    msgs = state["messages"]
+    state["steps"] = state.get("steps", 0) + 1
 
-    call = dict(tool_calls[0])            # {"name":..., "args":{...}, "id":...}
-    args = dict(call.get("args") or {})   # ✅ normalized structure
+    if state["steps"] > 24:
+        return {
+            "messages": [
+                AIMessage(content="I reached my reasoning limit while looping over tools")
+            ],
+        }
 
-    # ---- dataset fallback / persistence ----
-    fid = args.get("file_id_or_name") or state.get("last_dataset")
-    if not fid and state.get("attachments"):
-        fid = state["attachments"][0]
+    if state.get("must_finalize"):
+        guidance = HumanMessage(content=(
+            "Use the [Tool:] result above to answer the user. Do not call any tools again unless the user asks "
+            "for a new operation."
+        ))
+        res = llm.invoke([*msgs, guidance], tool_choice="none")
+        return {"messages": [guidance, res], "must_finalize": False}
 
-    if fid:
-        args["file_id_or_name"] = fid
-        state["last_dataset"] = fid
-
-    # Optional validation (comment out if not needed)
-    if fid and not _exists_in_uploads(fid):
-        tm = ToolMessage(
-            name=call.get("name") or "tool",
-            content=json.dumps({
-                "ok": False,
-                "error": "Invalid or missing dataset reference.",
-                "arguments": args
-            })
+    # If we have attachments but haven't grounded yet, nudge with a hint and force the tool choice to compute_dataset_facts.
+    if state.get("attachments") and not state.get("grounded"):
+        hint = HumanMessage(content=f"Available dataset files: {state['attachments']}")
+        res = llm.invoke(
+            [*msgs, hint],
+            tool_choice={"type": "function", "function": {"name": "compute_dataset_facts"}},
         )
-        return {"messages": state["messages"] + [tm], "must_finalize": True}
+        return {"messages": [hint, res]}
+    else:
+        res = llm.invoke(msgs)
+        # if your previous code wrapped tool_calls into an empty-content AIMessage, keep that:
+        tool_calls = getattr(res, "tool_calls", None)
+        if tool_calls and getattr(res, "content", None):
+            res = AIMessage(content="", tool_calls=tool_calls)
+        return {"messages": [res]}
 
-    call["args"] = args  # keep consistent shape
+# ---------- Router after LLM ----------
+def route_after_llm(state: AgentState) -> Literal["tools", "final"]:
+    """
+    Decide where to go after the LLM:
+    - If the last assistant message contains tool_calls -> run tools.
+    - Otherwise -> we're done (final).
+    """
+    last = state["messages"][-1]
 
-    # ---- run tool through your shim ----
-    res_msg = base.invoke_tool(call, state)
-    return {"messages": state["messages"] + [res_msg], "must_finalize": False}
+    if state.get("steps", 0) > _MAX_STEPS:
+        return "final"
 
+    tool_calls = getattr(last, "tool_calls", None)
+    return "tools" if tool_calls else "final"
 
-# ---------------- After Tools ----------------
+# ---------- Tools node ----------
+def tools_node() -> ToolNode:
+    """Runs the tools and appends ToolMessages to the state's messages list."""
+    base = ToolNode(TOOLS)
+
+    def run(state: AgentState) -> AgentState:
+        last = state["messages"][-1]
+        calls = getattr(last, "tool_calls", []) or []
+
+        if not calls:
+            return {"messages": state["messages"]}
+
+        normalized_calls = []
+        for c in calls:
+            # Accept either {"tool_name","arguments"} or {"name","args"}
+            name = c.get("name") or c.get("tool_name")
+            args = dict(c.get("args") or c.get("arguments") or {})
+            if not name:
+                # skip malformed entries
+                continue
+
+            # ---- dataset fallback & persistence (fix first histogram) ----
+            fid = args.get("file_id_or_name") or state.get("last_dataset")
+            if not fid and state.get("attachments"):
+                fid = state["attachments"][0]
+            if fid:
+                args["file_id_or_name"] = fid
+                state["last_dataset"] = fid
+
+            # (optional) validate path under uploads
+            # if fid and not _exists_in_uploads(fid):
+            #     tm = ToolMessage(
+            #         name=name,
+            #         content=json.dumps({"ok": False, "error": "Invalid or missing dataset reference.", "arguments": args})
+            #     )
+            #     return {"messages": state["messages"] + [tm], "must_finalize": True}
+
+            normalized_calls.append({
+                "name": name,
+                "args": args,
+                "id": c.get("id") or str(uuid.uuid4()),
+            })
+
+        # Replace the last AI message with a normalized one so ToolNode can execute it
+        last_ai = AIMessage(content=getattr(last, "content", "") or "", tool_calls=normalized_calls)
+        new_msgs = [*state["messages"][:-1], last_ai]
+        out = base.invoke({"messages": new_msgs})  # ToolNode expects the same state shape
+        return out
+
+    return run
+
+# ---------- After tools ----------
 def after_tools(state: AgentState) -> AgentState:
-    """Update grounding flags and persist dataset after tool run."""
-    last_msg = state["messages"][-1]
-    grounded = bool(state.get("grounded", False))
-    last_tool_name = getattr(last_msg, "name", None)
-
+    grounded = state.get("grounded", False)
+    last = state["messages"][-1]
+    last_tool_name = getattr(last, "name", None) if hasattr(last, "name") else None
     if last_tool_name == "compute_dataset_facts":
         grounded = True
 
-    new_state: AgentState = dict(state)
-    new_state.update({
-        "grounded": grounded,
-        "must_finalize": False,
-        "last_tool_name": last_tool_name,
-    })
-
-    # Persist dataset from tool payload if present
+    # persist last_dataset from tool payload if present
     try:
-        if isinstance(last_msg, ToolMessage):
-            payload = json.loads(last_msg.content)
+        if isinstance(last, ToolMessage):
+            payload = json.loads(last.content)
             fid = (payload.get("arguments") or {}).get("file_id_or_name")
             if fid:
-                new_state["last_dataset"] = fid
+                state["last_dataset"] = fid
     except Exception:
         pass
 
+    new_state = dict(state)  # copy
+    new_state.update({
+        "grounded": grounded,
+        "steps": state.get("steps", 0),
+        "must_finalize": False,
+        "last_tool_name": last_tool_name,
+    })
     return new_state
 
-
-# ---------------- Routing ----------------
-def route_after_llm(state: AgentState) -> Literal["tools", "final"]:
-    last = state["messages"][-1]
-    return "tools" if getattr(last, "tool_calls", None) else "final"
-
-
-# ---------------- Graph Builder ----------------
+# ---------- Graph builder ----------
 def build_graph():
     g = StateGraph(AgentState)
-
     g.add_node("llm", llm_node)
-    g.add_node("tools", tool_node)
+    g.add_node("tools", tools_node())
     g.add_node("after_tools", after_tools)
 
+    # After LLM: either go run tools (if tool_calls) or finish.
     g.add_conditional_edges("llm", route_after_llm, {"tools": "tools", "final": END})
+
+    # After tools: mark grounded/step++ then go back to LLM (loop).
     g.add_edge("tools", "after_tools")
     g.add_edge("after_tools", "llm")
 

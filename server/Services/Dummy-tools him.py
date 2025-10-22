@@ -1,10 +1,12 @@
-# server/services/dgen_toolshim.py
 from __future__ import annotations
 import json, re, uuid
 from typing import Any, Dict, List, Optional
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-# ---------------- TOOL HEADER ----------------
+from langchain_core.messages import (
+    BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
+)
+
+# ---------------- Prompt header ----------------
 TOOL_HEADER = (
     "You can call tools. When a tool is needed, reply with ONLY a single JSON object and nothing else.\n"
     'Schema: {"tool_name":"<name>","arguments":{...}}\n\n'
@@ -17,8 +19,7 @@ TOOL_HEADER = (
     "If no tool is needed, answer normally in plain text.\n"
 )
 
-
-# ---------------- Message Rendering ----------------
+# ---------------- Render messages for model ----------------
 def _render_messages(messages: List[BaseMessage]) -> str:
     lines: List[str] = []
     for m in messages:
@@ -33,61 +34,77 @@ def _render_messages(messages: List[BaseMessage]) -> str:
             lines.append(f"[ASSISTANT] {getattr(m, 'content', '') or ''}")
     return "\n".join(lines)
 
-
-# ---------------- Tool Prompt Generator ----------------
+# ---------------- Tools spec serializer ----------------
 def _tools_to_prompt(tools: List[Any]) -> str:
     items = []
     for t in tools or []:
-        name = getattr(t, "name", None) or ""
-        desc = getattr(t, "description", "").strip()
+        name = getattr(t, "name", "") or ""
+        desc = (getattr(t, "description", "") or "").strip()
         schema = getattr(t, "args_schema", None)
-        schema_json = json.dumps(schema.schema() if schema else {}, ensure_ascii=False)
+        schema_json = (schema.schema() if schema else {})
         items.append({"name": name, "description": desc, "parameters": schema_json})
-    return "TOOLS_SPEC:\n" + json.dumps(items, indent=2, ensure_ascii=False)
+    return "TOOLS_SPEC:\n" + json.dumps(items, ensure_ascii=False)
 
-
-_JSON_BLOCK = re.compile(r"({.+})", re.DOTALL)
-
+# Grab the first JSON object from the model text (even if surrounded by prose/fences)
+_JSON_BLOCK = re.compile(r"\{[\s\S]*\}", re.DOTALL)
 
 def _try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Accepts either:
+      {"tool_name":"x","arguments":{...}}
+    or:
+      {"name":"x","args":{...}}
+    Returns normalized: {"name":"x","args":{...}}
+    """
+    if not text:
+        return None
+    m = _JSON_BLOCK.search(text)
+    if not m:
+        return None
     try:
-        match = _JSON_BLOCK.search(text)
-        if not match:
-            return None
-        obj = json.loads(match.group(1))
-        if isinstance(obj, dict) and "tool_name" in obj:
-            return obj
+        obj = json.loads(m.group(0))
     except Exception:
         return None
 
+    if isinstance(obj, dict):
+        name = obj.get("name") or obj.get("tool_name")
+        args = obj.get("args") or obj.get("arguments") or {}
+        if name and isinstance(args, dict):
+            return {"name": name, "args": args}
+    return None
 
-# ---------------- Wrapper Class ----------------
 class ToolBoundSocgen:
-    """Wraps the DGen LLM to support bind_tools() and return AIMessage outputs."""
+    """
+    Adapter that:
+      * builds the full prompt (system header + tools spec + rendered messages)
+      * calls the underlying client (wired in your make_llm())
+      * returns AIMessage, optionally with .tool_calls normalized to {"name","args","id"}
+    """
 
     def __init__(self, client: Any = None, tools: Optional[List[Any]] = None):
         self.client = client
         self.tools = tools or []
 
-    def bind_tools(self, tools: List[Any]) -> ToolBoundSocgen:
+    def bind_tools(self, tools: List[Any]) -> "ToolBoundSocgen":
         return ToolBoundSocgen(client=self.client, tools=tools)
 
+    # Low-level model call wrapper (works with invoke/generate/callable clients)
     def _call_client(self, prompt: str) -> str:
-        """Unified call handler for OpenAI/Anthropic-style clients."""
         try:
             if hasattr(self.client, "invoke"):
                 out = self.client.invoke(prompt)
-                return out
+                return out if isinstance(out, str) else getattr(out, "text", str(out))
             if hasattr(self.client, "generate"):
-                return self.client.generate(prompt)
-            if hasattr(self.client, "__call__"):
+                out = self.client.generate(prompt)
+                return getattr(out, "text", str(out))
+            if callable(self.client):
                 return self.client(prompt)
-            raise RuntimeError("LLM client has no valid invoke/generate method.")
         except Exception as e:
-            return f"[Error invoking model: {e}]"
+            return f"[Model error: {e}]"
+        return ""
 
     def invoke(self, messages: List[BaseMessage], **kwargs) -> AIMessage:
-        tool_choice = kwargs.get("tool_choice")
+        tool_choice = kwargs.get("tool_choice", None)  # None -> tools allowed
         disable_tools = tool_choice == "none"
 
         rendered = _render_messages(messages)
@@ -97,6 +114,38 @@ class ToolBoundSocgen:
         if not disable_tools and self.tools:
             parsed = _try_parse_tool_call(text)
             if parsed:
-                return AIMessage(content=text, tool_calls=[parsed])
+                # ✅ LangChain expects name/args/id — NOT tool_name/arguments
+                tc = {"name": parsed["name"], "args": parsed["args"], "id": str(uuid.uuid4())}
+                return AIMessage(content=text, tool_calls=[tc])
 
         return AIMessage(content=text)
+
+    def invoke_tool(self, call: Dict[str, Any], state: Dict[str, Any]) -> ToolMessage:
+        """
+        Graph calls this to run a tool. Expects call = {"name": "...", "args": {...}}
+        """
+        name = call.get("name")
+        args = call.get("args", {}) or {}
+
+        # find tool implementation
+        tool_impl = None
+        for t in (self.tools or []):
+            if getattr(t, "name", None) == name:
+                tool_impl = t
+                break
+        if tool_impl is None:
+            return ToolMessage(name=name or "tool", content=json.dumps({
+                "ok": False, "error": f"Unknown tool '{name}'", "arguments": args
+            }))
+
+        try:
+            result = tool_impl.invoke(args) if hasattr(tool_impl, "invoke") else tool_impl(**args)
+            payload = result if isinstance(result, dict) else {"result": result}
+            # include arguments so after_tools can persist last_dataset
+            if "arguments" not in payload:
+                payload["arguments"] = args
+            return ToolMessage(name=name, content=json.dumps(payload))
+        except Exception as e:
+            return ToolMessage(name=name, content=json.dumps({
+                "ok": False, "error": f"Tool '{name}' failed: {e}", "arguments": args
+            }))

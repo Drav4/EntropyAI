@@ -1,41 +1,31 @@
 # server/agent/graph.py
-
-from __future__ import annotations
-
-from typing import TypedDict, Literal, List, Optional, Dict, Any
-
-import os
-
+import os, json
+from typing import TypedDict, List, Literal, Annotated, Optional
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-
 from langchain_core.messages import (
-    BaseMessage,
-    HumanMessage,
     AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
 )
+from services.dgen_toolshim import ToolBoundSocgen
+from tools_langgraph import TOOLS
+from config import UPLOAD_DIR
 
-from ..services.openai_client import make_llm  # your LLM factory
-from .tools_langgraph import TOOLS             # list of @tool(...) tools
-from ..config import UPLOAD_DIR
 
-
-# -----------------------------
-# Agent state
-# -----------------------------
+# ---------- Agent State ----------
 class AgentState(TypedDict, total=False):
-    messages: List[BaseMessage]          # full chat history
-    attachments: List[str]               # file IDs / names (uploads/)
-    must_finalize: bool                  # after tools, force a "no-tools" answer
-    steps: int                           # safety counter
+    messages: Annotated[List, "Messages exchanged with LLM"]
+    grounded: bool
+    must_finalize: bool
+    last_tool_name: Optional[str]
+    last_dataset: Optional[str]  # 👈 Persist dataset context
 
 
-MAX_STEPS = 12
+_MAX_STEPS = 8
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# ---------- Utils ----------
 def _exists_in_uploads(fid: Optional[str]) -> bool:
     if not fid:
         return False
@@ -43,110 +33,118 @@ def _exists_in_uploads(fid: Optional[str]) -> bool:
     return os.path.exists(path)
 
 
-# -----------------------------
-# Nodes
-# -----------------------------
+# ---------- LLM Node ----------
 def llm_node(state: AgentState) -> AgentState:
-    """
-    Core LLM node.
-    - Grounds the current attachment so the model uses it.
-    - If tools were just run, performs a finalization pass with tools disabled.
-    - If the model returns tool_calls, returns an AIMessage with EMPTY content
-      so the UI never sees a JSON blob.
-    """
-    llm = make_llm().bind_tools(TOOLS)
+    """Core LLM node."""
+    llm = ToolBoundSocgen().bind_tools(TOOLS)
+    step = state.get("step", 0) + 1
+    if step > _MAX_STEPS:
+        return {
+            "messages": [AIMessage(content="Reached reasoning limit while looping over tools.")],
+        }
 
-    steps = state.get("steps", 0) + 1
-    if steps > MAX_STEPS:
-        return {"messages": [AIMessage(content="Stopping: reasoning limit reached.")], "steps": steps}
-
-    msgs: List[BaseMessage] = list(state.get("messages", []))
-
-    # Ground the current attachment (if any) so the model doesn't invent filenames
-    if state.get("attachments"):
-        current = state["attachments"][0]
-        msgs.append(
-            HumanMessage(
-                content=f"[Attachments]\n#1: {current} (id:{current})\n"
-                        f"Use this file for any dataset operations."
-            )
-        )
-
-    # Finalization pass: answer using tool output; do NOT call tools again
-    if state.get("must_finalize"):
-        res = llm.invoke(msgs, tool_choice="none")
-        return {"messages": [res], "must_finalize": False, "steps": steps}
-
-    # Normal reasoning turn (tools allowed)
-    res = llm.invoke(msgs)
-
-    # If the model produced tool calls, strip any textual JSON from content
-    # so the UI doesn't render it; keep only tool_calls.
-    tool_calls = getattr(res, "tool_calls", None)
-    if tool_calls:
-        res = AIMessage(content="", tool_calls=tool_calls)
-
-    return {"messages": [res], "steps": steps}
+    # Compose conversation
+    msgs = state.get("messages", [])
+    out = llm.invoke(msgs, tool_choice="none", disable_tools=False)
+    return {
+        "messages": msgs + [out],
+        "step": step,
+        "must_finalize": False,
+    }
 
 
+# ---------- Tool Node ----------
+def tool_node(state: AgentState) -> AgentState:
+    """Runs tool and appends ToolMessage."""
+    base = ToolBoundSocgen()
+    last = state["messages"][-1]
+    call = getattr(last, "tool_calls", None) or [{}]
+    call = call[0]
+
+    fid = call.get("arguments", {}).get("file_id_or_name")
+
+    # --- Fix: fallback to last dataset if not provided
+    if not fid:
+        fid = state.get("last_dataset")
+
+    # --- Fallback to first uploaded attachment if still missing
+    if not fid and state.get("attachments"):
+        fid = state["attachments"][0]
+
+    # --- Persist dataset reference
+    if fid:
+        call["arguments"]["file_id_or_name"] = fid
+        state["last_dataset"] = fid
+
+    # --- Skip invalid attachment
+    if not _exists_in_uploads(fid):
+        return {
+            "messages": [
+                ToolMessage(content="Invalid or missing dataset reference.", name=call.get("name", "tool"))
+            ],
+            "must_finalize": True,
+        }
+
+    # Invoke tool safely
+    res = base.invoke_tool(call, state)
+    return {"messages": state["messages"] + [res], "must_finalize": False}
+
+
+# ---------- After Tools Node ----------
+def after_tools(state: AgentState) -> AgentState:
+    """Handle post-tool cleanup and memory persistence."""
+    last = state["messages"][-1]
+    grounded = state.get("grounded", False)
+    last_tool_name = getattr(last, "name", None)
+
+    if last_tool_name == "compute_dataset_facts":
+        grounded = True
+
+    new_state = dict(state)
+    new_state.update(
+        {
+            "grounded": grounded,
+            "step": state.get("step", 0) + 1,
+            "must_finalize": False,
+            "last_tool_name": last_tool_name,
+        }
+    )
+
+    # --- Persist last dataset used
+    try:
+        if isinstance(last, ToolMessage):
+            content = json.loads(last.content)
+            fid = content.get("arguments", {}).get("file_id_or_name")
+            if fid:
+                new_state["last_dataset"] = fid
+    except Exception:
+        pass
+
+    return new_state
+
+
+# ---------- Routing ----------
 def route_after_llm(state: AgentState) -> Literal["tools", "final"]:
-    """
-    Router: if the last assistant message contains tool_calls, go run tools.
-    Otherwise, we're done.
-    """
+    """Route based on whether tool calls exist."""
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None)
-    return "tools" if tool_calls else "final"
+    if tool_calls:
+        return "tools"
+    return "final"
 
 
-def tools_node():
-    """
-    Tool runner with argument grounding:
-    - If a tool call is missing/has a bad file_id_or_name, replace it with the
-      currently attached file before executing the tool.
-    """
-    base = ToolNode(TOOLS)
-
-    def run(state: AgentState) -> AgentState:
-        last = state["messages"][-1]
-        calls = getattr(last, "tool_calls", []) or []
-        for c in calls:
-            args: Dict[str, Any] = c.get("args", {})
-            fid = args.get("file_id_or_name")
-
-            # Ground to attachment if the model omitted or guessed a stale name
-            if (not _exists_in_uploads(fid)) and state.get("attachments"):
-                args["file_id_or_name"] = state["attachments"][0]
-
-        return base.invoke(state)
-
-    return run
-
-
-def after_tools(state: AgentState) -> AgentState:
-    """
-    After tools: mark that we must finalize in the next LLM turn.
-    """
-    return {"must_finalize": True}
-
-
-# -----------------------------
-# Graph builder
-# -----------------------------
+# ---------- Graph Builder ----------
 def build_graph():
     g = StateGraph(AgentState)
 
     g.add_node("llm", llm_node)
-    g.add_node("tools", tools_node())
+    g.add_node("tools", tool_node)
     g.add_node("after_tools", after_tools)
 
-    g.set_entry_point("llm")
-
-    # LLM → tools when tool_calls; otherwise finish
+    # Flow control
     g.add_conditional_edges("llm", route_after_llm, {"tools": "tools", "final": END})
-
-    # Tools → after_tools → LLM (finalization, tool_choice="none")
     g.add_edge("tools", "after_tools")
     g.add_edge("after_tools", "llm")
 
+    g.set_entry_point("llm")
     return g.compile()

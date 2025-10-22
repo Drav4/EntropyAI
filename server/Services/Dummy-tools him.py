@@ -45,15 +45,15 @@ def _tools_to_prompt(tools: List[Any]) -> str:
         items.append({"name": name, "description": desc, "parameters": schema_json})
     return "TOOLS_SPEC:\n" + json.dumps(items, ensure_ascii=False)
 
-# Grab the first JSON object from the model text (even if surrounded by prose/fences)
-_JSON_BLOCK = re.compile(r"\{[\s\S]*\}", re.DOTALL)
+# Grab first JSON object even if surrounded by extra text/fences
+_JSON_BLOCK = re.compile(r"\{[\s\S]*?\}", re.DOTALL)
 
 def _try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     """
     Accepts either:
-      {"tool_name":"x","arguments":{...}}
+      {"tool_name":"x","arguments":{...}}  (model per TOOL_HEADER)
     or:
-      {"name":"x","args":{...}}
+      {"name":"x","args":{...}}            (already normalized)
     Returns normalized: {"name":"x","args":{...}}
     """
     if not text:
@@ -72,6 +72,7 @@ def _try_parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
         if name and isinstance(args, dict):
             return {"name": name, "args": args}
     return None
+
 
 class ToolBoundSocgen:
     """
@@ -114,7 +115,7 @@ class ToolBoundSocgen:
         if not disable_tools and self.tools:
             parsed = _try_parse_tool_call(text)
             if parsed:
-                # ✅ LangChain expects name/args/id — NOT tool_name/arguments
+                # ✅ LangChain expects "name" / "args" / "id" (NOT tool_name/arguments)
                 tc = {"name": parsed["name"], "args": parsed["args"], "id": str(uuid.uuid4())}
                 return AIMessage(content=text, tool_calls=[tc])
 

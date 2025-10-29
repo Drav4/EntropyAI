@@ -1,11 +1,11 @@
-from typing import List, Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
-Role = Literal["user", "assistant", "system"]
-
-class ChatTurn(BaseModel):
-    role: Role
+class ChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant|system)$")
     content: str
 
 class ChatRequest(BaseModel):
-    messages: List[ChatTurn]
+    messages: List[ChatMessage]
+    file_id: Optional[str] = None
+    evidence_mode: bool = True

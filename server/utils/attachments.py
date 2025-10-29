@@ -1,35 +1,23 @@
-import os, re
-from typing import List, Optional
-from ..config import UPLOAD_DIR
+import re
+from typing import List, Dict
 
-ATTACH_RE = re.compile(
-    r"^\s*#\d+:\s*(?P<name>.+?)(?:\s*→\s*(?P<url>\S+))?(?:.*?\(id:(?P<id>[^)]+)\))?",
-    re.IGNORECASE,
+# Matches:
+#  [Attachments]
+#  #1: test.csv → /files/abcd123.csv (id:abcd123.csv)
+#  or any /files/<id.ext> without the (id:...) tail.
+_PATTERN = re.compile(
+    r"(?:#\d+\s*:\s*)?(?P<name>[\w\-.]+\.(?:csv|xlsx|xls|parquet|txt))"
+    r".*?(?:\(id:(?P<id1>[\w\-.]+)\)|/files/(?P<id2>[\w\-.]+))",
+    re.IGNORECASE | re.DOTALL,
 )
 
-def extract_attachment_candidates(text: str) -> List[str]:
-    if "[Attachments]" not in text:
+def extract_attachment_candidates(text: str | None) -> List[Dict[str, str]]:
+    if not text:
         return []
-    out: List[str] = []
-    for line in text.splitlines():
-        m = ATTACH_RE.search(line)
-        if not m: 
-            continue
-        fid = (m.group("id") or "").strip()
-        if fid:
-            out.append(fid)
-        else:
-            name = (m.group("name") or "").strip()
-            if name:
-                out.append(name)
+    out: List[Dict[str, str]] = []
+    for m in _PATTERN.finditer(text):
+        name = m.group("name")
+        fid = m.group("id1") or m.group("id2")
+        if name and fid:
+            out.append({"name": name, "id": fid})
     return out
-
-def resolve_to_upload_path(candidate: str) -> Optional[str]:
-    direct = os.path.join(UPLOAD_DIR, candidate)
-    if os.path.exists(direct):
-        return direct
-    base = os.path.splitext(candidate)[0]
-    for saved in os.listdir(UPLOAD_DIR):
-        if saved.startswith(base):
-            return os.path.join(UPLOAD_DIR, saved)
-    return None

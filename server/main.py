@@ -3,8 +3,6 @@ import uvicorn
 from .api.routes import create_app
 
 app = create_app()
-
-# Tighten for prod
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],

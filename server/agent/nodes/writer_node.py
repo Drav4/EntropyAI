@@ -1,22 +1,32 @@
 # server/agent/nodes/writer_node.py
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from ...llm import make_llm
 from ..state import GraphState
+from langchain_core.messages import HumanMessage
 
+# ---------------------------------------------------------------------
+# SYSTEM PROMPT
+# ---------------------------------------------------------------------
 WRITER_SYSTEM = """
-You are a senior data scientist.
-Write a concise, technical answer in Markdown using ONLY the structured facts you are given.
-Rules:
-- Do NOT mention internal tool or function names.
-- Do NOT invent numbers or fields. If a value is missing, say "Not computed".
-- Prefer bullet points and short sentences. Include key metrics and what they imply.
-- Recommendations must be justified strictly by the facts (e.g., imbalance ratio, feature types, correlations, missingness).
-- Never output JSON. Output Markdown only.
+You are a senior data-science copilot writing concise, technical Markdown summaries.
+
+Core principles:
+- Derive all reasoning ONLY from the structured facts and the user's intent.
+- Keep tone analytical but natural — avoid template repetition.
+- When the user explicitly requests a task family (classification, clustering, etc.),
+  lock your recommendations to that family only.
+- Merge dataset facts and interpretations in one 'Dataset Overview' section.
+- Each bullet: show the fact ➜ interpret what it implies for modeling.
+- Always include: Recommended Algorithms, Preprocessing & Feature Handling,
+  Evaluation Strategy, and Next Steps.
 """
 
-_writer = make_llm(system_prompt=WRITER_SYSTEM, temperature=0.1)
+_writer = make_llm(system_prompt=WRITER_SYSTEM, temperature=0.45)
 
+# ---------------------------------------------------------------------
+# UTILITIES
+# ---------------------------------------------------------------------
 def _fmt_pct(v: Any) -> str:
     try:
         return f"{float(v)*100:.1f}%"
@@ -25,95 +35,144 @@ def _fmt_pct(v: Any) -> str:
 
 def _strong_corr_count(corr_pairs: Any) -> int:
     try:
-        return sum(1 for p in (corr_pairs or []) if isinstance(p, dict) and abs(float(p.get("pearson", 0))) >= 0.7)
+        return sum(1 for p in (corr_pairs or [])
+                   if isinstance(p, dict) and abs(float(p.get("pearson", 0))) >= 0.7)
     except Exception:
         return 0
 
-def _derive_reco(facts: Dict[str, Any]) -> List[str]:
-    """Small deterministic addendum derived from facts only."""
-    recos: List[str] = []
+def _len_or_zero(x: Optional[list]) -> int:
+    return len(x or [])
+
+def _detect_requested_family(state: GraphState) -> str:
+    """Detect explicit or implicit user intent."""
+    facts = state.facts or {}
+    explicit = (facts.get("requested_family") or "").strip().lower()
+    if explicit:
+        return explicit.capitalize()
+
+    # fall back to latest human message
+    text = ""
+    for msg in reversed(state.messages or []):
+        if isinstance(msg, HumanMessage):
+            text = (msg.content or "").lower()
+            break
+
+    if any(k in text for k in ["cluster", "clustering", "unsupervised"]):
+        return "Clustering"
+    if any(k in text for k in ["regression", "regressor"]):
+        return "Regression"
+    if any(k in text for k in ["forecast", "time series", "timeseries"]):
+        return "Forecasting"
+    if any(k in text for k in ["anomaly", "outlier"]):
+        return "Anomaly Detection"
+    return ""
+
+def _task_candidates_from_facts(facts: Dict[str, Any]) -> List[str]:
     tgt = (facts.get("target") or {})
     cols = (facts.get("columns") or {})
-    corr = (facts.get("correlation") or {})
-    miss = (facts.get("missing") or {})
+    has_target = bool(tgt.get("name"))
+    classy = isinstance(tgt.get("classes"), int) and tgt["classes"] > 1
+    likely_class = classy or (tgt.get("positive_rate") is not None)
+    has_dt = _len_or_zero(cols.get("datetime")) > 0
+    many_feats = (_len_or_zero(cols.get("numeric")) +
+                  _len_or_zero(cols.get("categorical")) +
+                  _len_or_zero(cols.get("datetime"))) >= 20
+    cands: List[str] = []
+    if not has_target:
+        cands.extend(["Clustering", "Anomaly Detection"])
+    else:
+        cands.append("Classification" if likely_class else "Regression")
+    if has_dt:
+        cands.append("Forecasting")
+    if many_feats:
+        cands.append("Dimensionality Reduction")
+    seen = set()
+    return [c for c in cands if not (c in seen or seen.add(c))]
 
-    imb = tgt.get("imbalance_ratio")
-    pos_rate = tgt.get("positive_rate")
-    if isinstance(imb, (int, float)) and imb > 1.5:
-        recos.append("Use class weighting or resampling to address class imbalance.")
-    elif isinstance(pos_rate, (int, float)) and (pos_rate < 0.3 or pos_rate > 0.7):
-        recos.append("Target is skewed; consider class weighting or resampling.")
-
-    if cols.get("numeric"):
-        recos.append("Tree ensembles (RandomForest, Gradient Boosting/XGBoost) work well for numeric features and non-linearities.")
-    if cols.get("categorical"):
-        recos.append("Ensure proper categorical encoding (one-hot/target encoding) before modeling.")
-    if _strong_corr_count((corr or {}).get("pairs")) > 0:
-        recos.append("High inter-feature correlation detected; prefer regularization or tree ensembles to handle multicollinearity.")
-
-    total_pct = (miss or {}).get("total_pct")
-    if isinstance(total_pct, (int, float)) and total_pct > 0.01:
-        recos.append("Impute missing values (median for numeric, most-frequent for categorical) or use models robust to missingness.")
-
-    recos.append("Include a simple baseline (Logistic Regression for classification) for interpretability and calibration.")
-    return recos
-
+# ---------------------------------------------------------------------
+# MAIN NODE
+# ---------------------------------------------------------------------
 def writer_node(state: GraphState) -> GraphState:
-    """Synthesize the only user-facing answer from structured facts."""
-    # If no facts, avoid printing "Not computed" walls.
+    """Generate the final Markdown analysis using dataset facts + user intent."""
     if not state.facts:
         state.final_answer = (
-            "I couldn’t compute dataset facts yet. Please ensure a dataset is attached and the target column "
-            "is specified (e.g., `Target: label`)."
+            "I couldn’t compute dataset facts yet. Please attach a dataset "
+            "and specify the target column or analysis intent."
         )
         return state
 
     facts = state.facts or {}
-    dataset = facts.get("dataset") or {}
-    cols = facts.get("columns") or {}
-    tgt = facts.get("target") or {}
-    miss = facts.get("missing") or {}
-    corr = facts.get("correlation") or {}
+    ds, cols, tgt = facts.get("dataset", {}), facts.get("columns", {}), facts.get("target", {})
+    miss, corr = facts.get("missing", {}), facts.get("correlation", {})
 
+    # Determine task family
+    requested_family = _detect_requested_family(state)
+    auto_candidates = _task_candidates_from_facts(facts)
+    intent_line = requested_family if requested_family else ", ".join(auto_candidates) or "Unclear"
+    hard_rule = ""
+    if requested_family:
+        hard_rule = (
+            f"Hard constraint: The user explicitly requested **{requested_family}**. "
+            "Recommend algorithms ONLY for this family, even if a target exists."
+        )
+
+    # -----------------------------------------------------------------
+    # PROMPT CONSTRUCTION
+    # -----------------------------------------------------------------
     prompt = f"""
-Summarize model-selection-relevant characteristics and produce recommendations using ONLY these facts:
+You will produce a structured technical Markdown answer.
 
-Dataset
-- file: {dataset.get('file_id') or "Not provided"}
-- rows: {dataset.get('rows') if dataset.get('rows') is not None else "Not computed"}
-- cols: {dataset.get('cols') if dataset.get('cols') is not None else "Not computed"}
+Task family to consider: {intent_line}
+{hard_rule}
 
-Target
-- name: {tgt.get('name') or "Not provided"}
-- classes: {tgt.get('classes') if tgt.get('classes') is not None else "Not computed"}
-- positive_rate: {_fmt_pct(tgt.get('positive_rate'))}
-- imbalance_ratio: {tgt.get('imbalance_ratio') if tgt.get('imbalance_ratio') is not None else "Not computed"}
+## Dataset Overview
+Provide one cohesive bullet list that merges dataset facts with interpretation.
+Each bullet must both *state* the metric and *explain its implication* for modeling.
+Example style:
+- **Rows:** 5000 → medium-sized dataset; suitable for algorithms up to quadratic complexity.
 
-Features
-- numeric: {len(cols.get('numeric') or [])}
-- categorical: {len(cols.get('categorical') or [])}
-- datetime: {len(cols.get('datetime') or [])}
+Facts:
+- Rows: {ds.get('rows','Not computed')}
+- Columns: {ds.get('cols','Not computed')}
+- Target: {tgt.get('name') or 'None'}
+- Classes: {tgt.get('classes') if tgt.get('classes') is not None else 'Not computed'}
+- Positive rate: {_fmt_pct(tgt.get('positive_rate'))}
+- Imbalance ratio: {tgt.get('imbalance_ratio') if tgt.get('imbalance_ratio') is not None else 'Not computed'}
+- Numeric features: {_len_or_zero(cols.get('numeric'))}
+- Categorical features: {_len_or_zero(cols.get('categorical'))}
+- Datetime features: {_len_or_zero(cols.get('datetime'))}
+- Missing values (%): {_fmt_pct(miss.get('total_pct'))}
+- Strong correlation pairs (|r|≥0.7): {_strong_corr_count((corr or {}).get('pairs'))}
 
-Missingness
-- total_pct: {_fmt_pct(miss.get('total_pct'))}
-- per_column: {"available" if isinstance(miss.get('per_column'), dict) else "Not computed"}
+## Recommended Algorithms
+List and rank 2–4 algorithms within ONLY the relevant family.  
+Each bullet should include:
+- short factual reason for suitability
+- short note on when it may underperform (e.g., sensitive to scale, noise, imbalance).
 
-Correlations
-- strong_pairs(|r|≥0.7): {_strong_corr_count((corr or {}).get('pairs'))}
+If **Clustering**, consider options like k-means, k-prototypes, DBSCAN/HDBSCAN,
+Agglomerative, or GMM, depending on data types and size.
 
-Output Markdown with sections:
-- **Data Characteristics**
-- **Recommended Algorithms** (2–4 items; each with one-line justification tied to the facts)
-- **Limitations / Next Steps**
+## Preprocessing & Feature Handling
+State only what applies to THIS family.
+Mention scaling, encoding, missing-value treatment, dimensionality reduction, or
+distance metrics as relevant.
+
+## Evaluation Strategy
+Describe proper validation for THIS family:
+- Classification → stratified k-fold, macro-F1/ROC-AUC.
+- Regression → k-fold, MAE/RMSE.
+- Clustering → silhouette, Davies–Bouldin, Calinski–Harabasz, stability checks.
+Include key hyperparameters to tune for each algorithm.
+
+## Next Steps
+List 2–4 concrete actions for improving model selection or performance.
+
+Avoid templated phrasing; write as if you’re a senior data scientist summarizing findings.
 """
 
     msg = _writer.invoke(prompt)
-    derived = _derive_reco(facts)
-    final = msg.content.rstrip()
-    if derived:
-        final += "\n\n**Additional recommendations (derived from facts):**\n- " + "\n- ".join(derived)
-
-    state.final_answer = final
+    state.final_answer = msg.content.strip()
     state.messages.append(msg)
     state.steps += 1
     return state

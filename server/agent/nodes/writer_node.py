@@ -11,11 +11,10 @@ WRITER_SYSTEM = """
 You are a senior data-science copilot writing concise, technical Markdown summaries.
 
 Guidelines:
-- Derive reasoning ONLY from structured facts and the user's intent.
-- Keep tone analytical and practical.
-- Respect explicit family requests (classification, clustering, regression, etc.).
-- If explicit family exists, NEVER override it with automatic inference.
-- Otherwise, infer likely families from dataset facts (target type, datetime columns, etc.).
+- Derive reasoning ONLY from structured facts and the current user intent.
+- NEVER persist task families across turns; re-evaluate each query independently.
+- Respect explicit family requests (classification, clustering, etc.) for this message only.
+- If no explicit family is mentioned, infer from dataset facts (target type, datetime, etc.).
 - Include: Dataset Overview, Recommended Algorithms, Preprocessing, Evaluation Strategy, Next Steps.
 """
 
@@ -26,7 +25,7 @@ answer with:
 2. Practical intuition
 3. 3–5 common examples or variants
 4. When to use vs. when not to use
-Keep it under 12 sentences and avoid filler.
+Keep it under 12 sentences.
 """
 
 # ---------------------------------------------------------------------
@@ -41,12 +40,10 @@ You are a strict router for a data-science assistant.
 Return EXACTLY one token: CONCEPT or DATA.
 
 Rules:
-- CONCEPT = the user asks about DS/ML theory, algorithm definitions, comparisons,
-  intuition, formulas, or conceptual best practices (e.g., "What is gradient descent?").
-- DATA = the user requests dataset analysis, model recommendation, EDA, etc.
+- CONCEPT = theoretical ML/DS questions (definitions, algorithm explanations, comparisons, formulas, etc.)
+- DATA = dataset or experiment-based questions (EDA, model suggestions, correlations, etc.)
 - Return only CONCEPT or DATA, no punctuation.
 """
-
 _classifier_llm = make_llm(system_prompt=_CLASSIFIER_SYSTEM, temperature=0.0)
 
 # ---------------------------------------------------------------------
@@ -64,31 +61,29 @@ def _len_or_zero(x: Optional[list]) -> int:
 def _fmt_pct(v: Any) -> str:
     try:
         f = float(v)
-        if f > 1:  # already in %
+        if f > 1:
             return f"{f:.1f}%"
         return f"{f * 100:.1f}%"
     except Exception:
         return "Not computed"
 
-# ---- restored from your original family heuristics ----
-def _detect_requested_family(state: GraphState) -> str:
-    facts = getattr(state, "facts", {}) or {}
-    explicit = (facts.get("requested_family") or "").strip().lower()
-    if explicit:
-        return explicit.capitalize()
-
-    text = _latest_user_text(getattr(state, "messages", [])).lower()
+# Explicit vs inferred task family (always recomputed per message)
+def _detect_task_family(user_text: str, facts: Dict[str, Any]) -> (str, str):
+    """Returns (explicit_family, inferred_family)"""
+    text = user_text.lower()
+    explicit = ""
     if any(k in text for k in ["cluster", "clustering", "unsupervised"]):
-        return "Clustering"
-    if any(k in text for k in ["regression", "regressor"]):
-        return "Regression"
-    if any(k in text for k in ["forecast", "time series", "timeseries"]):
-        return "Forecasting"
-    if any(k in text for k in ["anomaly", "outlier"]):
-        return "Anomaly Detection"
-    return ""
+        explicit = "Clustering"
+    elif any(k in text for k in ["classification", "classify"]):
+        explicit = "Classification"
+    elif any(k in text for k in ["regression", "regressor"]):
+        explicit = "Regression"
+    elif any(k in text for k in ["forecast", "time series", "timeseries"]):
+        explicit = "Forecasting"
+    elif any(k in text for k in ["anomaly", "outlier"]):
+        explicit = "Anomaly Detection"
 
-def _task_candidates_from_facts(facts: Dict[str, Any]) -> List[str]:
+    # auto inference from facts
     tgt = facts.get("target") or {}
     cols = facts.get("columns") or {}
     has_target = bool(tgt.get("name"))
@@ -100,17 +95,19 @@ def _task_candidates_from_facts(facts: Dict[str, Any]) -> List[str]:
         + _len_or_zero(cols.get("categorical"))
         + _len_or_zero(cols.get("datetime"))
     ) >= 20
-    cands: List[str] = []
+    inferred = []
     if not has_target:
-        cands.extend(["Clustering", "Anomaly Detection"])
+        inferred.extend(["Clustering", "Anomaly Detection"])
     else:
-        cands.append("Classification" if likely_class else "Regression")
+        inferred.append("Classification" if likely_class else "Regression")
     if has_dt:
-        cands.append("Forecasting")
+        inferred.append("Forecasting")
     if many_feats:
-        cands.append("Dimensionality Reduction")
+        inferred.append("Dimensionality Reduction")
+    # dedup
     seen = set()
-    return [c for c in cands if not (c in seen or seen.add(c))]
+    inferred = [f for f in inferred if not (f in seen or seen.add(f))]
+    return explicit, ", ".join(inferred) if inferred else "Unclear"
 
 # ---------------------------------------------------------------------
 # MAIN NODE
@@ -119,8 +116,8 @@ def writer_node(state: GraphState) -> GraphState:
     """
     Final writer stage.
       1. Conceptual Q&A → LLM explanation (no dataset)
-      2. Dataset-driven summary → structured technical guidance
-      3. Fallback → ask user to provide dataset or intent
+      2. Dataset-driven summary → structured guidance
+      3. Fallback → request dataset/intent
     """
     messages = getattr(state, "messages", []) or []
     facts: Dict[str, Any] = getattr(state, "facts", {}) or {}
@@ -128,7 +125,7 @@ def writer_node(state: GraphState) -> GraphState:
     user_text = _latest_user_text(messages)
     has_any_facts = bool(facts) or bool(tool_outs)
 
-    # ---------- Step 1: Concept-vs-Data classification (LLM) ----------
+    # Step 1: classify query intent (Concept vs Data)
     verdict = "DATA"
     if user_text:
         try:
@@ -137,10 +134,11 @@ def writer_node(state: GraphState) -> GraphState:
         except Exception:
             verdict = "DATA"
 
-    # ---------- MODE 1: Conceptual Q&A ----------
+    # -----------------------------------------------------------------
+    # MODE 1 — Conceptual Q&A
+    # -----------------------------------------------------------------
     if verdict.startswith("CONCEPT") and not has_any_facts:
-        prompt = f"User question:\n{user_text}\n"
-        msg = _concept_llm.invoke(prompt)
+        msg = _concept_llm.invoke(f"User question:\n{user_text}")
         answer = (msg.content or "").strip() or "Could you clarify what concept you want explained?"
         state.final_answer = answer
         state.messages.append(msg)
@@ -148,7 +146,9 @@ def writer_node(state: GraphState) -> GraphState:
             state.steps = int(getattr(state, "steps", 0) or 0) + 1
         return state
 
-    # ---------- MODE 2: Dataset-driven summary ----------
+    # -----------------------------------------------------------------
+    # MODE 2 — Dataset-driven summary
+    # -----------------------------------------------------------------
     if facts:
         ds = facts.get("dataset", {})
         cols = facts.get("columns", {})
@@ -156,30 +156,23 @@ def writer_node(state: GraphState) -> GraphState:
         miss = facts.get("missing", {})
         corr = facts.get("correlation", {})
 
-        requested_family = _detect_requested_family(state)
-        auto_candidates = _task_candidates_from_facts(facts)
-        intent_line = (
-            requested_family
-            if requested_family
-            else ", ".join(auto_candidates) or "Unclear"
-        )
-
+        explicit_family, inferred_family = _detect_task_family(user_text, facts)
+        active_family = explicit_family or inferred_family
         hard_rule = ""
-        if requested_family:
+        if explicit_family:
             hard_rule = (
-                f"Hard constraint: The user explicitly requested **{requested_family}**. "
+                f"Hard constraint: The user explicitly requested **{explicit_family}**. "
                 "Recommend algorithms ONLY for this family, even if a target exists."
             )
 
-        # Construct the dataset-based prompt (your old structure)
         prompt = f"""
 You will produce a structured technical Markdown answer.
 
-Task family to consider: {intent_line}
+Task family to consider: {active_family}
 {hard_rule}
 
 ## Dataset Overview
-Provide cohesive bullet points combining metrics with interpretation.
+Provide concise bullets that merge metrics with interpretation.
 
 Facts:
 - Rows: {ds.get('rows','Not computed')}
@@ -195,22 +188,20 @@ Facts:
 - Strong correlation pairs (|r|≥0.7): {len((corr or {}).get('pairs') or [])}
 
 ## Recommended Algorithms
-List 2–4 algorithms within ONLY the relevant family. For clustering, consider
-k-means, DBSCAN/HDBSCAN, Agglomerative, or GMM; for classification, pick
-appropriate supervised models. Justify each briefly.
+List 2–4 algorithms ONLY within the relevant family.
+If clustering: k-means, DBSCAN/HDBSCAN, Agglomerative, GMM, etc.
+If classification: logistic regression, random forest, XGBoost, LightGBM, etc.
+If regression: linear, ridge/lasso, XGBoost regressor, etc.
+Justify briefly when each performs best or worst.
 
 ## Preprocessing & Feature Handling
-Mention only what applies to THIS family (scaling, encoding, missing-value treatment, etc.).
+Mention what applies for THIS family only (scaling, encoding, imputation, etc.).
 
 ## Evaluation Strategy
-Describe proper validation:
-- Classification → stratified k-fold, macro-F1/ROC-AUC
-- Regression → k-fold, MAE/RMSE
-- Clustering → silhouette, Davies–Bouldin
-- Forecasting → rolling-window or walk-forward validation
+Describe validation per family (classification → stratified k-fold; clustering → silhouette, etc.)
 
 ## Next Steps
-List 2–4 concrete actions to improve data quality or model selection.
+List 2–4 concrete actions for improving data quality or model selection.
 """
 
         msg = _writer.invoke(prompt)
@@ -220,7 +211,9 @@ List 2–4 concrete actions to improve data quality or model selection.
             state.steps = int(getattr(state, "steps", 0) or 0) + 1
         return state
 
-    # ---------- MODE 3: Fallback ----------
+    # -----------------------------------------------------------------
+    # MODE 3 — Fallback
+    # -----------------------------------------------------------------
     fallback = (
         "I couldn’t compute dataset facts yet. Please attach a CSV/XLSX "
         "and specify your task (classification, regression, clustering, etc.) "

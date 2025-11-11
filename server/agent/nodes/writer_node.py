@@ -1,12 +1,13 @@
 # server/agent/nodes/writer_node.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
+import re
+from langchain_core.messages import HumanMessage
 from ...llm import make_llm
 from ..state import GraphState
-from langchain_core.messages import HumanMessage
 
 # ---------------------------------------------------------------------
-# SYSTEM PROMPT
+# SYSTEM PROMPTS
 # ---------------------------------------------------------------------
 WRITER_SYSTEM = """
 You are a senior data-science copilot writing concise, technical Markdown summaries.
@@ -22,14 +23,46 @@ Core principles:
   Evaluation Strategy, and Next Steps.
 """
 
+# Used only for conceptual Q&A (no dataset facts)
+CONCEPT_SYSTEM = """
+You are a concise data-science mentor. For conceptual DS/ML questions (no dataset),
+answer with:
+1) A one-line definition,
+2) Practical intuition,
+3) 3–5 common examples or variants,
+4) When to use vs. when not to use.
+Keep it under ~12 sentences and avoid fluff.
+"""
+
 _writer = make_llm(system_prompt=WRITER_SYSTEM, temperature=0.45)
+_concept_llm = make_llm(system_prompt=CONCEPT_SYSTEM, temperature=0.2)
 
 # ---------------------------------------------------------------------
-# UTILITIES
+# LIGHTWEIGHT DETECTORS
+# ---------------------------------------------------------------------
+# Conceptual Q&A detector (e.g., "what is X", "explain Y", "compare A and B")
+_CONCEPT_PAT = re.compile(
+    r"\b(what\s+is|define|explain|difference\s+between|compare|pros\s*and\s*cons|"
+    r"when\s+to\s+use|how\s+does|intuition\s+behind|why\s+use|advantages?|disadvantages?)\b.*"
+    r"\b(classification|regression|clustering|supervised|unsupervised|semi[- ]?supervised|"
+    r"reinforcement\s*learning|neural\s*network|cnn|rnn|transformer|attention|embedding|"
+    r"feature\s+engineering|normalization|standardization|cross[- ]?validation|bias[- ]?variance|"
+    r"regularization|dropout|batch\s*norm|precision|recall|f1|roc|auc|confusion\s*matrix|pca|"
+    r"tsne|umap|silhouette|dbscan|k[- ]?means|hdbscan|grid\s*search|random\s*search|"
+    r"time\s*series|forecast(ing)?)\b",
+    re.I,
+)
+
+# ---------------------------------------------------------------------
+# UTILITIES (preserved from your file, plus a tiny helper)
 # ---------------------------------------------------------------------
 def _fmt_pct(v: Any) -> str:
     try:
-        return f"{float(v)*100:.1f}%"
+        # Accept values already in 0..1 or already in % terms
+        fv = float(v)
+        if fv > 1.0:
+            return f"{fv:.1f}%"
+        return f"{fv*100:.1f}%"
     except Exception:
         return "Not computed"
 
@@ -43,6 +76,17 @@ def _strong_corr_count(corr_pairs: Any) -> int:
 def _len_or_zero(x: Optional[list]) -> int:
     return len(x or [])
 
+def _latest_user_text(messages: List[Any]) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            return (msg.content or "").strip()
+    return ""
+
+def _is_conceptual_query(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_CONCEPT_PAT.search(text))
+
 def _detect_requested_family(state: GraphState) -> str:
     """Detect explicit or implicit user intent."""
     facts = state.facts or {}
@@ -51,11 +95,7 @@ def _detect_requested_family(state: GraphState) -> str:
         return explicit.capitalize()
 
     # fall back to latest human message
-    text = ""
-    for msg in reversed(state.messages or []):
-        if isinstance(msg, HumanMessage):
-            text = (msg.content or "").lower()
-            break
+    text = _latest_user_text(state.messages).lower()
 
     if any(k in text for k in ["cluster", "clustering", "unsupervised"]):
         return "Clustering"
@@ -93,15 +133,42 @@ def _task_candidates_from_facts(facts: Dict[str, Any]) -> List[str]:
 # MAIN NODE
 # ---------------------------------------------------------------------
 def writer_node(state: GraphState) -> GraphState:
-    """Generate the final Markdown analysis using dataset facts + user intent."""
-    if not state.facts:
+    """
+    Final natural-language answer.
+      - Concept Q&A (no facts) → explain concept (no tools).
+      - Dataset summary (facts present) → your original structured guidance.
+      - Fallback → ask for dataset and intent.
+    """
+    messages = getattr(state, "messages", []) or []
+    facts: Dict[str, Any] = getattr(state, "facts", {}) or {}
+    tool_outs: List[Dict[str, Any]] = getattr(state, "tool_outputs", []) or []
+    user_text = _latest_user_text(messages)
+
+    has_any_facts = bool(facts) or bool(tool_outs)
+
+    # -------- Mode 1: Conceptual Q&A (no facts) --------
+    if _is_conceptual_query(user_text) and not has_any_facts:
+        prompt = (
+            "Answer the user's conceptual DS/ML question clearly.\n\n"
+            f"User question:\n{user_text}\n"
+        )
+        msg = _concept_llm.invoke(prompt)
+        answer = (msg.content or "").strip() or \
+            "This is a conceptual DS/ML question; please clarify what you’d like me to explain."
+        state.final_answer = answer
+        state.messages.append(msg)
+        if hasattr(state, "steps"):
+            state.steps = int(getattr(state, "steps", 0) or 0) + 1
+        return state
+
+    # -------- Mode 2: Your original dataset-driven flow (preserved) --------
+    if not facts:
         state.final_answer = (
             "I couldn’t compute dataset facts yet. Please attach a dataset "
             "and specify the target column or analysis intent."
         )
         return state
 
-    facts = state.facts or {}
     ds, cols, tgt = facts.get("dataset", {}), facts.get("columns", {}), facts.get("target", {})
     miss, corr = facts.get("missing", {}), facts.get("correlation", {})
 
@@ -117,7 +184,7 @@ def writer_node(state: GraphState) -> GraphState:
         )
 
     # -----------------------------------------------------------------
-    # PROMPT CONSTRUCTION
+    # PROMPT CONSTRUCTION (your original style)
     # -----------------------------------------------------------------
     prompt = f"""
 You will produce a structured technical Markdown answer.
@@ -172,7 +239,8 @@ Avoid templated phrasing; write as if you’re a senior data scientist summarizi
 """
 
     msg = _writer.invoke(prompt)
-    state.final_answer = msg.content.strip()
+    state.final_answer = (msg.content or "").strip()
     state.messages.append(msg)
-    state.steps += 1
+    if hasattr(state, "steps"):
+        state.steps = int(getattr(state, "steps", 0) or 0) + 1
     return state

@@ -19,6 +19,12 @@ You alternate between two modes:
 [READY_MODE]
 - If enough facts are present, output exactly: READY_FOR_WRITER
 
+CONCEPT GATE:
+- If the latest user request is a conceptual DS/ML question (definitions, comparisons,
+  theory, pros/cons, “what is…”, “explain…”, “compare…”), DO NOT call any tools.
+  Instead, say READY_FOR_WRITER so the writer can answer.
+- If the request is clearly outside DS/ML (handled upstream by guard), also say READY_FOR_WRITER.
+
 Do NOT produce the final user-facing answer. The writer will do that.
 """
 
